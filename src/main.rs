@@ -190,11 +190,29 @@ struct CommandVolumeProps {
     channel_volumes: Vec<f64>,
 }
 
+fn is_decimal_value(value: &str) -> bool {
+    value.parse::<f64>()
+        .ok()
+        .is_some()
+}
+
 fn is_decimal_percentage(value: &str) -> bool {
     value
         .strip_suffix('%')
         .and_then(|value| value.parse::<f32>().ok())
         .is_some()
+}
+
+fn reverse_pow_to_linear(value: f64, reverse_pow: f64) -> f64 {
+    value.powf(reverse_pow)
+}
+
+fn linear_to_reverse_pow(value: f64, reverse_pow: f64) -> f64 {
+    value.powf(1.0 / reverse_pow)
+}
+
+fn reverse_pow_increment(value: f64, increment: f64, reverse_pow: f64) -> f64 {
+    reverse_pow_to_linear(linear_to_reverse_pow(value, reverse_pow) + increment, reverse_pow)
 }
 
 fn parse_dump<'a>(
@@ -278,22 +296,32 @@ fn pw_cli<'a>(
             let delta = arg
                 .value_of("DELTA")
                 .ok_or_else(|| anyhow!("DELTA argument not found"))?;
+            let reverse_pow_volume_scale = arg
+                .value_of("REVERSE_POW_VOLUME_SCALE")
+                .unwrap_or("1.0");
             let percent = &delta[..delta.len() - 1].parse::<f64>()?;
+            let reverse_pow = reverse_pow_volume_scale.parse::<f64>()?;
             let increment = percent * 0.01;
             let mut vols = Vec::with_capacity(route.props.channel_volumes.len());
             for vol in route.props.channel_volumes.iter() {
-                let new_vol = (vol + increment).clamp(0.0, 1.0);
+                let new_vol = reverse_pow_increment(*vol, increment, reverse_pow)
+                    .clamp(0.0, 1.0);
                 vols.push(new_vol);
             }
             cmd.props.channel_volumes = vols;
         }
-        ("status", _) => {
+        ("status", Some(arg)) => {
             if route.props.mute {
                 println!(r#"{{"alt":"mute", "tooltip":"muted", "class":"muted"}}"#);
             } else {
+                let reverse_pow_volume_scale = arg
+                    .value_of("REVERSE_POW_VOLUME_SCALE")
+                    .unwrap_or("1.0");
+                let reverse_pow = reverse_pow_volume_scale.parse::<f64>()?;
                 // assumes that all channels have the same volume.
                 let vol = route.props.channel_volumes[0];
-                let percentage = vol * 100.0;
+                let scaled_vol = linear_to_reverse_pow(vol, reverse_pow);
+                let percentage = scaled_vol * 100.0;
                 println!(
                     r#"{{"percentage":{:.0}, "tooltip":"{}%"}}"#,
                     percentage, percentage
@@ -344,6 +372,19 @@ mod tests {
 
 fn main() {
     // parse cli flags
+    let pow_volume_scale_arg = Arg::with_name("REVERSE_POW_VOLUME_SCALE")
+        .help("decimal reverse exponent value, e.g. '2', '-3.2'")
+        .long("reverse-pow-volume-scale")
+        .required(false)
+        .takes_value(true)
+        .allow_hyphen_values(true)
+        .validator(move |s| {
+            if is_decimal_value(&s) {
+                Ok(())
+            } else {
+                Err(format!(r#""{}" is not a decimal value"#, s))
+            }
+        });
     let matches = App::new("pw-volume")
         .about("Basic interface to PipeWire volume controls")
         .settings(&[
@@ -382,9 +423,14 @@ fn main() {
                                 Err(format!(r#""{}" is not a decimal percentage"#, s))
                             }
                         }),
-                ),
+                )
+                .arg(pow_volume_scale_arg.clone())
         )
-        .subcommand(SubCommand::with_name("status").about("get volume and mute information"))
+        .subcommand(
+            SubCommand::with_name("status")
+                .about("get volume and mute information")
+                .arg(pow_volume_scale_arg)
+        )
         .get_matches();
 
     // call pw-dump and unmarshal its output
